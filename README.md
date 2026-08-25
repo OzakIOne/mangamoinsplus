@@ -1,9 +1,62 @@
-# WXT + React
+# Mangamoins+
 
-This template should help get you started developing with React in WXT.
+A Chrome/Firefox extension that downloads manga chapters as image files from [mangamoins.com](https://mangamoins.com) and [raijin-scans.fr](https://raijin-scans.fr), built with [WXT](https://wxt.dev) and React.
+
+## What it does
+
+- **Auto-detects chapters**: open any chapter page on a supported site and the popup shows the manga title, chapter number, and page count.
+- **One-click download**: every page of the chapter is saved into an organized folder (e.g. `One Piece/Chapter 1100/page_001.png`) instead of a messy pile of files.
+- **Works around anti-hotlinking**: images are fetched through the page itself (same session, real cookies) so Cloudflare-protected servers don't block the download.
+- **Robust page detection**: reads the reader's embedded image list first, then falls back to scanning loaded images / probing URL patterns — including split chapters like `346-1`, `346-2`.
+
+## Install in your browser
+
+### From a release (recommended)
+
+1. Grab the latest `mangamoinsplus-*.zip` from the [GitHub Releases](../../releases) page and unzip it.
+2. Open `chrome://extensions` in Chrome (or Edge/Brave/etc.).
+3. Enable **Developer mode** (top-right toggle).
+4. Click **Load unpacked** and select the unzipped folder (`mangamoinsplus-chrome-mv3`).
+
+The icon appears in your toolbar — pin it if you want quick access.
+
+### From source
+
+Requires [Bun](https://bun.sh).
 
 ```bash
-git clone
-pnpm i
-pnpm build
+git clone <this-repo>
+cd mangamoinsplus
+bun install
+bun run build
 ```
+
+Then follow steps 2–4 above, selecting `build/mangamoinsplus-chrome-mv3`.
+
+### Firefox
+
+Only temporary installation is supported (unsigned extension):
+
+```bash
+bun run build:firefox
+```
+
+Then open `about:debugging#/runtime/this-firefox`, click **Load Temporary Add-on**, and pick `manifest.json` inside `build/mangamoinsplus-firefox-mv3`. You'll need to reload it after restarting Firefox.
+
+## Usage
+
+1. Navigate to a chapter page on mangamoins.com or raijin-scans.fr.
+2. Click the extension icon — the chapter is detected automatically.
+3. Hit **Download Chapter**. Pages land in your default Downloads folder.
+
+## Development
+
+```bash
+bun install       # install dependencies (also runs `wxt prepare`)
+bun run dev       # start dev mode with auto-reload
+bun run compile   # type-check (tsc --noEmit)
+bun run build     # production build for Chrome
+bun run zip       # package the built extension as a zip
+```
+
+Firefox variants: `bun run dev:firefox` and `bun run build:firefox`.
