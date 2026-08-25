@@ -1,8 +1,14 @@
 import { useState } from "react";
 
 interface ChapterInfo {
-  mangaSlug: string;
+  site?: string;
+  mangaSlug?: string;
   chapterSlug: string;
+  totalPages?: number;
+  baseUrl?: string;
+  pagePadding?: number;
+  imageExtension?: string;
+  imageUrls?: string[];
 }
 
 export default function App() {
@@ -30,15 +36,27 @@ export default function App() {
   async function handleDownload() {
     if (!chapterInfo) return;
     setStatus("loading");
-    setProgress("Starting download...");
+    setProgress("Downloading...");
 
     try {
-      await browser.runtime.sendMessage({
+      const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+      const res = (await browser.runtime.sendMessage({
         type: "DOWNLOAD_CHAPTER",
+        tabId: tab?.id,
         ...chapterInfo,
-      });
-      setStatus("done");
-      setProgress("All pages sent to downloads!");
+      })) as { downloaded?: number; error?: string } | undefined;
+
+      const n = res?.downloaded ?? 0;
+      if (res?.error) {
+        setStatus("error");
+        setProgress(`❌ ${n} page(s) avant échec — ${res.error}`);
+      } else if (n > 0) {
+        setStatus("done");
+        setProgress(`${n} page${n > 1 ? "s" : ""} downloaded!`);
+      } else {
+        setStatus("error");
+        setProgress("Aucune page téléchargée. Recharge la page du chapitre et réessaie.");
+      }
     } catch (e) {
       setStatus("error");
       setProgress(`Error: ${String(e)}`);
@@ -54,7 +72,20 @@ export default function App() {
 
       {chapterInfo ? (
         <>
-          <p>📄 Chapter: <strong>{chapterInfo.chapterSlug}</strong></p>
+          {chapterInfo.mangaSlug && (
+            <p>
+              📚{" "}
+              <strong>
+                {toTitleCase(chapterInfo.mangaSlug)}
+              </strong>
+            </p>
+          )}
+          <p>
+            📄 Chapter: <strong>{chapterInfo.chapterSlug}</strong>
+            {chapterInfo.imageUrls?.length
+              ? ` · ${chapterInfo.imageUrls.length} pages`
+              : ""}
+          </p>
           <button
             onClick={handleDownload}
             disabled={status === "loading"}
@@ -70,4 +101,11 @@ export default function App() {
       {progress && <p style={{ marginTop: 8, fontSize: 12 }}>{progress}</p>}
     </div>
   );
+}
+
+function toTitleCase(slug: string) {
+  return slug
+    .split("-")
+    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .join(" ");
 }

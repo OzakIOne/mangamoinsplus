@@ -7,6 +7,6 @@ export default defineConfig({
   outDirTemplate: "mangamoinsplus-{{browser}}-mv{{manifestVersion}}",
   manifest: {
     permissions: ["downloads", "activeTab", "scripting"],
-    host_permissions: ["*://mangamoins.com/*"],
+    host_permissions: ["*://mangamoins.com/*", "*://raijin-scans.fr/*"],
   },
 });
