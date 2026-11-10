@@ -1,104 +1,138 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import {
+  isChapterInfo,
+  isDownloadProgress,
+  readDownloadResult,
+  type ChapterInfo,
+  type OutputFormat,
+} from "@/lib/messages";
 
-interface ChapterInfo {
-  site?: string;
-  mangaSlug?: string;
-  chapterSlug: string;
-  totalPages?: number;
-  baseUrl?: string;
-  pagePadding?: number;
-  imageExtension?: string;
-  imageUrls?: string[];
-}
+const STATUS_LABELS = {
+  idle: "⬇️ Télécharger le chapitre",
+  loading: "Téléchargement…",
+  done: "⬇️ Télécharger le chapitre",
+  error: "⬇️ Réessayer",
+} as const;
 
 export default function App() {
-  const [status, setStatus] = useState<"idle" | "loading" | "done" | "error">("idle");
-  const [progress, setProgress] = useState("");
-  const [chapterInfo, setChapterInfo] = useState<ChapterInfo | null>(null);
+  const [status, setStatus] = useState<keyof typeof STATUS_LABELS>("idle");
+  const [message, setMessage] = useState("");
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
+  const [format, setFormat] = useState<OutputFormat>("cbz");
+  const [chapter, setChapter] = useState<ChapterInfo | null>(null);
+
+  useEffect(() => {
+    void detectChapter();
+  }, []);
+
+  useEffect(() => {
+    const listener = (candidate: unknown) => {
+      if (!isDownloadProgress(candidate)) return undefined;
+      setProgress({ done: candidate.done, total: candidate.total });
+      return undefined;
+    };
+    browser.runtime.onMessage.addListener(listener);
+    return () => browser.runtime.onMessage.removeListener(listener);
+  }, []);
 
   async function detectChapter() {
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-    if (!tab.id) return;
+    if (!tab?.id) return;
 
-    const info = await browser.tabs.sendMessage(tab.id, {
-      type: "GET_CHAPTER_INFO",
-    });
-
-    if (!info) {
+    const info: unknown = await browser.tabs.sendMessage(tab.id, { type: "GET_CHAPTER_INFO" });
+    if (!isChapterInfo(info)) {
       setStatus("error");
-      setProgress("Not on a manga chapter page");
+      setMessage("Ouvre une page de chapitre MangaMoins ou Raijin Scans.");
       return;
     }
-
-    setChapterInfo(info);
+    setChapter(info);
   }
 
   async function handleDownload() {
-    if (!chapterInfo) return;
+    if (!chapter) return;
     setStatus("loading");
-    setProgress("Downloading...");
+    setProgress(null);
+    setMessage("Préparation…");
 
-    try {
-      const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-      const res = (await browser.runtime.sendMessage({
-        type: "DOWNLOAD_CHAPTER",
-        tabId: tab?.id,
-        ...chapterInfo,
-      })) as { downloaded?: number; error?: string } | undefined;
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    const response: unknown = await browser.runtime
+      .sendMessage({ type: "DOWNLOAD_CHAPTER", format, tabId: tab?.id, chapter })
+      .catch((error) => ({ downloaded: 0, error: String(error) }));
 
-      const n = res?.downloaded ?? 0;
-      if (res?.error) {
-        setStatus("error");
-        setProgress(`❌ ${n} page(s) avant échec — ${res.error}`);
-      } else if (n > 0) {
-        setStatus("done");
-        setProgress(`${n} page${n > 1 ? "s" : ""} downloaded!`);
-      } else {
-        setStatus("error");
-        setProgress("Aucune page téléchargée. Recharge la page du chapitre et réessaie.");
-      }
-    } catch (e) {
+    const result = readDownloadResult(response);
+    if (!result) {
       setStatus("error");
-      setProgress(`Error: ${String(e)}`);
+      setMessage("Réponse inattendue du service worker.");
+      return;
     }
+    if (result.error) {
+      setStatus("error");
+      setMessage(`❌ ${result.downloaded} page(s) avant échec — ${result.error}`);
+      return;
+    }
+    if (result.downloaded === 0) {
+      setStatus("error");
+      setMessage("Aucune page téléchargée. Recharge la page du chapitre et réessaie.");
+      return;
+    }
+    setStatus("done");
+    setMessage(
+      result.file
+        ? `✅ ${result.downloaded} pages → ${result.file}`
+        : `✅ ${result.downloaded} page${result.downloaded > 1 ? "s" : ""} téléchargée${result.downloaded > 1 ? "s" : ""}`,
+    );
   }
 
-  // Auto-detect on mount
-  useState(() => { detectChapter(); });
+  const pageCount = chapter?.site === "raijin" ? chapter.imageUrls?.length : chapter?.totalPages;
 
   return (
     <div style={{ width: 300, padding: 16, fontFamily: "sans-serif" }}>
       <h2>🎨 Manga Downloader</h2>
 
-      {chapterInfo ? (
+      {chapter ? (
         <>
-          {chapterInfo.mangaSlug && (
+          {chapter.site === "raijin" && (
             <p>
-              📚{" "}
-              <strong>
-                {toTitleCase(chapterInfo.mangaSlug)}
-              </strong>
+              📚 <strong>{toTitleCase(chapter.mangaSlug)}</strong>
             </p>
           )}
           <p>
-            📄 Chapter: <strong>{chapterInfo.chapterSlug}</strong>
-            {chapterInfo.imageUrls?.length
-              ? ` · ${chapterInfo.imageUrls.length} pages`
-              : ""}
+            📄 Chapter: <strong>{chapter.chapterSlug}</strong>
+            {pageCount ? ` · ${pageCount} pages` : ""}
           </p>
+
+          <label
+            style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 13, marginBottom: 10 }}
+          >
+            <input
+              type="checkbox"
+              checked={format === "cbz"}
+              disabled={status === "loading"}
+              onChange={(event) => setFormat(event.target.checked ? "cbz" : "images")}
+            />
+            Regrouper en un fichier .cbz
+          </label>
+
           <button
             onClick={handleDownload}
             disabled={status === "loading"}
             style={{ width: "100%", padding: 8, cursor: "pointer" }}
           >
-            {status === "loading" ? "Downloading..." : "⬇️ Download Chapter"}
+            {STATUS_LABELS[status]}
           </button>
         </>
       ) : (
-        <p>Navigate to a manga chapter page first.</p>
+        <p>Ouvre d'abord une page de chapitre.</p>
       )}
 
-      {progress && <p style={{ marginTop: 8, fontSize: 12 }}>{progress}</p>}
+      {status === "loading" && progress && (
+        <p style={{ marginTop: 8, fontSize: 12 }}>
+          {progress.total > progress.done
+            ? `${progress.done}/${progress.total} pages…`
+            : `${progress.done} page(s)…`}
+        </p>
+      )}
+      {message && status !== "loading" && <p style={{ marginTop: 8, fontSize: 12 }}>{message}</p>}
     </div>
   );
 }
@@ -106,6 +140,6 @@ export default function App() {
 function toTitleCase(slug: string) {
   return slug
     .split("-")
-    .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
 }

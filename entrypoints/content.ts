@@ -1,7 +1,11 @@
+import { bytesToBase64, imageMime, sniffImageExtension } from "@/lib/binary";
+import type { ChapterInfo, FetchImageRequest, FetchImageResponse } from "@/lib/messages";
+
 export default defineContentScript({
   matches: ["*://mangamoins.com/*", "*://raijin-scans.fr/*"],
   main() {
-    browser.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    browser.runtime.onMessage.addListener((message: unknown, _sender, sendResponse) => {
+      if (!isMessage(message)) return undefined;
       if (message.type === "GET_CHAPTER_INFO") {
         const data = getChapterInfo();
         sendResponse(data);
@@ -12,15 +16,25 @@ export default defineContentScript({
       // session de la page, et on les renvoie en data URL.
       if (message.type === "FETCH_IMAGE") {
         fetchAsDataURL(message.url)
-          .then((dataUrl) => sendResponse({ ok: true, dataUrl }))
-          .catch((err) => sendResponse({ ok: false, error: String(err?.message ?? err) }));
+          .then((dataUrl) => sendResponse({ ok: true, dataUrl } satisfies FetchImageResponse))
+          .catch((error) =>
+            sendResponse({ ok: false, error: String(error?.message ?? error) } satisfies FetchImageResponse),
+          );
         return true;
       }
+      return undefined;
     });
   },
 });
 
-function getChapterInfo() {
+const isMessage = (
+  message: unknown,
+): message is { type: "GET_CHAPTER_INFO" } | FetchImageRequest => {
+  if (typeof message !== "object" || message === null) return false;
+  return "type" in message && typeof Reflect.get(message, "type") === "string";
+};
+
+function getChapterInfo(): ChapterInfo | null {
   const url = window.location.href;
   if (/mangamoins\.com/.test(url)) return getMangamoinsInfo();
   if (/raijin-scans\.fr/.test(url)) return getRaijinInfo(url);
@@ -30,28 +44,23 @@ function getChapterInfo() {
 async function fetchAsDataURL(url: string): Promise<string> {
   const res = await fetch(url, { credentials: "include" });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const blob = await res.blob();
-  if (!blob.type.startsWith("image/")) {
-    throw new Error(`Not an image: ${blob.type}`);
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  const extension = sniffImageExtension(bytes);
+  if (!extension) {
+    throw new Error(`pas une image (${res.headers.get("content-type") ?? "type inconnu"})`);
   }
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = () => reject(reader.error);
-    reader.readAsDataURL(blob);
-  });
+  return `data:${imageMime(extension)};base64,${bytesToBase64(bytes)}`;
 }
 
-function getMangamoinsInfo() {
+function getMangamoinsInfo(): ChapterInfo | null {
   const url = window.location.href;
   const match = url.match(/\/scan\/([^/?#]+)/);
   if (!match) return null;
   const chapterSlug = match[1];
-  const totalPages = Number(
-    document.getElementById("readerTotalPages")?.textContent
-  );
+  const totalPages = Number(document.getElementById("readerTotalPages")?.textContent);
   const img = document.querySelector("img[src*='.webp']") as HTMLImageElement;
   if (!img) return null;
+  if (!Number.isFinite(totalPages) || totalPages < 1) return null;
   const src = img.src;
 
   const baseMatch = src.match(/(.*\/)(\d+)\.webp$/);
@@ -66,7 +75,7 @@ function getMangamoinsInfo() {
   };
 }
 
-function getRaijinInfo(url: string) {
+function getRaijinInfo(url: string): ChapterInfo | null {
   // Le slug du chapitre peut contenir un suffixe pour les chapitres découpés :
   // 345, 346-1, 346-2…
   const match = url.match(/\/manga\/([^/?#]+)\/([^/?#]+)\/?/);

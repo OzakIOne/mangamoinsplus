@@ -1,272 +1,421 @@
+import {
+  bytesToBase64,
+  dataUrlToBytes,
+  imageExtension,
+  imageMime,
+  looksLikeImage,
+  type Bytes,
+} from "@/lib/binary";
+import {
+  isDownloadRequest,
+  type ChapterInfo,
+  type DownloadProgress,
+  type DownloadRequest,
+  type DownloadResult,
+  type FetchImageRequest,
+  type FetchImageResponse,
+  type RevokeBlobUrlRequest,
+} from "@/lib/messages";
+import { createZip, type ZipFile } from "@/lib/zip";
+
+const MAX_PAGES = 500;
+const MAX_CONSECUTIVE_MISSES = 5;
+const CBZ_MIME = "application/vnd.comicbook+zip";
+const PAGE_NUMBER_WIDTH = 4;
+const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"];
+
+interface PlannedPage {
+  url: string;
+  name: string;
+}
+
+interface ProbeInfo {
+  baseUrl: string;
+  extension: string;
+  padding: number;
+  startPage: number;
+}
+
+interface ChapterPlan {
+  folder: string;
+  pages: PlannedPage[];
+  probe?: ProbeInfo;
+  preferDirect: boolean;
+}
+
+interface PageChunk extends PlannedPage {
+  bytes?: Bytes;
+}
+
+interface DownloadTarget {
+  url: string;
+  filename: string;
+  expectImage: boolean;
+}
+
+interface OffscreenDocument {
+  ensure: () => Promise<void>;
+  reset: () => void;
+}
+
 export default defineBackground({
   main() {
-    browser.runtime.onMessage.addListener((message, _sender) => {
-      if (message.type === "DOWNLOAD_CHAPTER") {
-        return Promise.resolve(
-          downloadChapter(message).catch((err) => ({
-            downloaded: 0,
-            error: String(err?.message ?? err),
-          }))
-        );
-      }
+    browser.runtime.onMessage.addListener((message: unknown) => {
+      if (!isDownloadRequest(message)) return undefined;
+      return downloadChapter(message).catch((error) => ({
+        downloaded: 0,
+        error: describeError(error),
+      }));
     });
   },
 });
 
-type ChapterMessage =
-  | {
-      site: "mangamoins";
-      chapterSlug: string;
-      totalPages: number;
-      baseUrl: string;
-    }
-  | {
-      site: "raijin";
-      mangaSlug: string;
-      chapterSlug: string;
-      /** Onglet de la page : on y délègue la récupération des images. */
-      tabId?: number;
-      /** Liste exacte des images extraite de la page (stratégie prioritaire). */
-      imageUrls?: string[];
-      /** Plan B : URL de référence pour la boucle de sondes. */
-      baseUrl?: string;
-      pagePadding?: number;
-      imageExtension?: string;
-    };
-
-interface DownloadResult {
-  downloaded: number;
-  error?: string;
-}
-
-async function downloadChapter(message: ChapterMessage): Promise<DownloadResult> {
-  if (message.site === "raijin") {
-    return downloadRaijinChapter(message);
-  }
-  if (message.site === "mangamoins") {
-    return downloadMangamoinsChapter(message);
-  }
-  return { downloaded: 0, error: "Site inconnu" };
-}
-
-async function downloadMangamoinsChapter({
-  chapterSlug,
-  totalPages,
-  baseUrl,
-}: Extract<ChapterMessage, { site: "mangamoins" }>): Promise<DownloadResult> {
-  const downloads = [];
-
-  for (let i = 1; i <= totalPages; i++) {
-    const page = String(i).padStart(2, "0");
-    downloads.push(
-      browser.downloads.download({
-        url: `${baseUrl}${page}.webp`,
-        filename: `${chapterSlug}/page_${page}.webp`,
-        saveAs: false,
-      })
-    );
-  }
-
-  await Promise.all(downloads);
-  return { downloaded: downloads.length };
-}
-
-async function downloadRaijinChapter({
-  mangaSlug,
-  chapterSlug,
-  baseUrl,
-  pagePadding,
-  imageExtension,
-  imageUrls,
-  tabId,
-}: Extract<ChapterMessage, { site: "raijin" }>): Promise<DownloadResult> {
-  const folder = `${toTitleCase(mangaSlug)}/Chapter ${chapterSlug}`;
-  let downloaded = 0;
-
-  // Stratégie principale : la liste exacte des images extraite de la page
-  // (ts_reader ou images chargées). On préserve les noms de fichiers d'origine.
-  let lastPageNumber = 0;
-  if (imageUrls?.length) {
-    for (const [index, url] of imageUrls.entries()) {
-      const clean = url.split("#")[0];
-      const fileName = clean.slice(clean.lastIndexOf("/") + 1).split("?")[0];
-      const res = await downloadRaijinImage(tabId, clean, `${folder}/${fileName}`);
-      if (!res.ok) {
-        return {
-          downloaded,
-          error:
-            `Page ${index + 1}/${imageUrls.length} (${fileName || "sans nom"}) a échoué. ` +
-            (res.error ?? "Cause inconnue"),
-        };
-      }
-      const num = Number(fileName.match(/(\d+)/)?.[1] ?? 0);
-      if (num > lastPageNumber) lastPageNumber = num;
-      downloaded++;
-    }
-
-    // Pas d'infos de sonde -> la liste était forcément complète.
-    if (!baseUrl || !imageExtension) return { downloaded };
-  }
-
-  // Plan B : sondes sur une URL de référence.
-  if (!baseUrl || !imageExtension) {
+async function downloadChapter({ format, tabId, chapter }: DownloadRequest): Promise<DownloadResult> {
+  const plan = planChapter(chapter);
+  if (plan.pages.length === 0 && !plan.probe) {
     return { downloaded: 0, error: "Aucune image trouvée sur la page du chapitre" };
   }
+  return format === "cbz" ? downloadAsCbz({ tabId, plan }) : downloadAsImages({ tabId, plan });
+}
 
-  const pad = pagePadding || 3;
-  const maxPages = 500; // garde-fou au cas où le site répondrait 200 au-delà de la dernière page
+function planChapter(chapter: ChapterInfo): ChapterPlan {
+  return chapter.site === "mangamoins" ? planMangamoins(chapter) : planRaijin(chapter);
+}
 
-  // Les pages d'un même chapitre peuvent avoir des extensions différentes
-  // (ex. 001.png, 002.jpg, 003.png…) : on teste l'extension détectée en premier.
-  const extensions = [
-    imageExtension,
-    ...["png", "jpg", "jpeg", "webp"].map((e) => `.${e}`).filter((e) => e !== imageExtension),
-  ];
+function planMangamoins({ chapterSlug, totalPages, baseUrl }: Extract<ChapterInfo, { site: "mangamoins" }>): ChapterPlan {
+  const padding = Math.max(2, String(totalPages).length);
+  const pages = Array.from({ length: totalPages }, (_, index) => {
+    const number = String(index + 1).padStart(padding, "0");
+    return { url: `${baseUrl}${number}.webp`, name: `page_${number}.webp` };
+  });
+  return { folder: chapterSlug, pages, preferDirect: true };
+}
 
-  // Certains chapitres découpés ne commencent pas à 001 et le lazy-loading
-  // peut sauter des numéros : on tolère des trous, avec un plafond d'échecs
-  // consécutifs pour détecter la vraie fin du chapitre.
-  const maxConsecutiveMisses = 5;
-  let consecutiveMisses = 0;
+function planRaijin({ mangaSlug, chapterSlug, imageUrls, baseUrl, pagePadding, imageExtension }: Extract<ChapterInfo, { site: "raijin" }>): ChapterPlan {
+  const pages = (imageUrls ?? []).map((raw) => {
+    const url = raw.split("#")[0];
+    return { url, name: fileName(url) };
+  });
 
-  for (let page = Math.max(1, lastPageNumber + 1); page <= maxPages; page++) {
-    const name = String(page).padStart(pad, "0");
+  const lastPage = pages.reduce((highest, page) => Math.max(highest, pageNumber(page.url)), 0);
+  const probe =
+    baseUrl && imageExtension
+      ? {
+          baseUrl,
+          extension: imageExtension,
+          padding: pagePadding || 3,
+          startPage: Math.max(1, lastPage + 1),
+        }
+      : undefined;
 
-    // On cherche la vraie URL de la page parmi les extensions possibles.
-    let imageUrl: string | null = null;
-    for (const ext of extensions) {
-      const candidate = `${baseUrl}${name}${ext}`;
-      if (await raijinUrlIsImage(tabId, candidate)) {
-        imageUrl = candidate;
-        break;
-      }
+  return {
+    folder: `${toTitleCase(mangaSlug)}/Chapter ${chapterSlug}`,
+    pages,
+    ...(probe ? { probe } : {}),
+    preferDirect: false,
+  };
+}
+
+async function downloadAsCbz({ tabId, plan }: { tabId: number | undefined; plan: ChapterPlan }): Promise<DownloadResult> {
+  const files: ZipFile[] = [];
+
+  for await (const page of chapterPages({ tabId, plan })) {
+    const bytes = page.bytes ?? (await fetchImageBytes({ tabId, url: page.url, attempts: 2 }));
+    if (!bytes) {
+      return {
+        downloaded: files.length,
+        error: `Page ${files.length + 1} illisible (${page.url}). Réessaie, ou passe en mode « images séparées ».`,
+      };
     }
+    files.push({
+      name: zipEntryName({ index: files.length + 1, extension: imageExtension({ url: page.url, bytes }) }),
+      bytes,
+    });
+    void reportProgress({ done: files.length, total: plan.pages.length });
+  }
 
-    // Aucune extension ne répond avec une image : soit un trou dans la
-    // numérotation, soit la fin du chapitre.
-    if (!imageUrl) {
-      consecutiveMisses++;
-      if (consecutiveMisses >= maxConsecutiveMisses) break;
-      continue;
-    }
-    consecutiveMisses = 0;
+  if (files.length === 0) {
+    return { downloaded: 0, error: "Aucune page récupérable pour ce chapitre." };
+  }
 
-    const ext = imageUrl.slice(imageUrl.lastIndexOf("."));
-    const res = await downloadRaijinImage(tabId, imageUrl, `${folder}/${name}${ext}`);
-    if (!res.ok) {
+  const filename = `${plan.folder}.cbz`;
+  const delivery = await deliverFile({ bytes: createZip({ files }), filename, mime: CBZ_MIME });
+  if (!delivery.ok) return { downloaded: files.length, error: delivery.error };
+  return { downloaded: files.length, file: filename };
+}
+
+async function downloadAsImages({ tabId, plan }: { tabId: number | undefined; plan: ChapterPlan }): Promise<DownloadResult> {
+  let downloaded = 0;
+
+  for await (const page of chapterPages({ tabId, plan })) {
+    const filename = `${plan.folder}/${page.name}`;
+    const preloaded =
+      page.bytes ?? (plan.preferDirect ? undefined : await fetchImageBytes({ tabId, url: page.url, attempts: 2 }));
+    const saved = await savePage({ tabId, plan, page, filename, preloaded });
+    if (!saved.ok) {
       return {
         downloaded,
-        error: `Page ${page} (${name}${ext}) a échoué. ${res.error ?? "Cause inconnue"}`,
+        error: `Page ${downloaded + 1} (${page.name}) : ${saved.error ?? "échec inconnu"}`,
       };
     }
     downloaded++;
+    void reportProgress({ done: downloaded, total: plan.pages.length });
   }
 
   if (downloaded === 0) {
-    return { downloaded: 0, error: `Aucun fichier image trouvé sous ${baseUrl}…` };
+    return { downloaded: 0, error: "Aucune page récupérable pour ce chapitre." };
   }
   return { downloaded };
 }
 
-/**
- * Les serveurs de scan bloquent souvent le hotlinking / Cloudflare bloque les
- * requêtes hors session : on demande donc au content script (même origine,
- * vrais cookies + Referer) de récupérer l'image et de nous la renvoyer en
- * data URL, que Chrome peut alors télécharger sans refaire de requête réseau.
- */
-async function fetchViaContentScript(
-  tabId: number | undefined,
-  url: string
-): Promise<{ dataUrl: string } | { error: string }> {
-  if (tabId === undefined) {
-    return { error: "Onglet introuvable (popup fermée ?)" };
+async function savePage({
+  tabId,
+  plan,
+  page,
+  filename,
+  preloaded,
+}: {
+  tabId: number | undefined;
+  plan: ChapterPlan;
+  page: PageChunk;
+  filename: string;
+  preloaded: Bytes | undefined;
+}): Promise<{ ok: boolean; error?: string }> {
+  if (plan.preferDirect) {
+    const direct = await downloadAndWait({ url: page.url, filename, expectImage: true });
+    if (direct.ok) return direct;
   }
+
+  const bytes = preloaded ?? (await fetchImageBytes({ tabId, url: page.url, attempts: 2 }));
+  if (!bytes) return { ok: false, error: "récupération impossible (session ou protection anti-hotlink)" };
+
+  const dataUrl = `data:${imageMime(imageExtension({ url: page.url, bytes }))};base64,${bytesToBase64(bytes)}`;
+  return downloadAndWait({ url: dataUrl, filename, expectImage: true });
+}
+
+async function* chapterPages({
+  tabId,
+  plan,
+}: {
+  tabId: number | undefined;
+  plan: ChapterPlan;
+}): AsyncGenerator<PageChunk> {
+  for (const page of plan.pages) yield page;
+
+  const probe = plan.probe;
+  if (!probe) return;
+
+  const extensions = [probe.extension, ...IMAGE_EXTENSIONS.filter((ext) => ext !== probe.extension)];
+  let consecutiveMisses = 0;
+
+  for (let page = probe.startPage; page <= MAX_PAGES; page++) {
+    const number = String(page).padStart(probe.padding, "0");
+    const found = await probePage({ tabId, probe, number, extensions });
+    if (!found) {
+      consecutiveMisses++;
+      if (consecutiveMisses >= MAX_CONSECUTIVE_MISSES) return;
+      continue;
+    }
+    consecutiveMisses = 0;
+    yield found;
+  }
+}
+
+async function probePage({
+  tabId,
+  probe,
+  number,
+  extensions,
+}: {
+  tabId: number | undefined;
+  probe: ProbeInfo;
+  number: string;
+  extensions: string[];
+}): Promise<PageChunk | undefined> {
+  for (const extension of extensions) {
+    const url = `${probe.baseUrl}${number}${extension}`;
+    const bytes = await fetchImageBytes({ tabId, url });
+    if (bytes) return { url, name: `${number}${extension}`, bytes };
+  }
+  return undefined;
+}
+
+async function fetchImageBytes({
+  tabId,
+  url,
+  attempts = 1,
+}: {
+  tabId: number | undefined;
+  url: string;
+  attempts?: number;
+}): Promise<Bytes | undefined> {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const bytes = await fetchImageOnce({ tabId, url });
+    if (bytes) return bytes;
+  }
+  return undefined;
+}
+
+async function fetchImageOnce({
+  tabId,
+  url,
+}: {
+  tabId: number | undefined;
+  url: string;
+}): Promise<Bytes | undefined> {
+  const fromPage = await fetchViaContentScript({ tabId, url });
+  if ("dataUrl" in fromPage) {
+    const bytes = dataUrlToBytes(fromPage.dataUrl);
+    if (looksLikeImage(bytes)) return bytes;
+  }
+  return fetchImageDirectly(url);
+}
+
+async function fetchImageDirectly(url: string): Promise<Bytes | undefined> {
   try {
-    const res = await browser.tabs.sendMessage(tabId, { type: "FETCH_IMAGE", url });
-    if (res?.ok) return { dataUrl: res.dataUrl as string };
-    return { error: `Content script: ${res?.error ?? "échec sans détail"}` };
-  } catch (err) {
-    // sendMessage lève si le content script n'est pas injecté (page rechargée ?)
-    const msg = err instanceof Error ? err.message : String(err);
-    return { error: `Onglet injoignable: ${msg}` };
+    const response = await fetch(url, { credentials: "include" });
+    if (!response.ok) return undefined;
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    return looksLikeImage(bytes) ? bytes : undefined;
+  } catch {
+    return undefined;
   }
 }
 
-async function downloadRaijinImage(
-  tabId: number | undefined,
-  url: string,
-  filename: string
-): Promise<{ ok: boolean; error?: string }> {
-  // 1. Data URL via le content script (contourne le blocage hotlink/Cloudflare).
-  const fetched = await fetchViaContentScript(tabId, url);
-  if ("dataUrl" in fetched) {
-    const dl = await downloadAndWait(fetched.dataUrl, filename);
-    if (dl.ok) return { ok: true };
-    // Le téléchargement de la data URL a échoué : on note pourquoi et on tente le direct.
-    console.warn(`[mangamoins+] data URL failed for ${filename}: ${dl.error}`);
+async function fetchViaContentScript({
+  tabId,
+  url,
+}: {
+  tabId: number | undefined;
+  url: string;
+}): Promise<{ dataUrl: string } | { error: string }> {
+  if (tabId === undefined) return { error: "onglet introuvable (popup fermée ?)" };
+  const request: FetchImageRequest = { type: "FETCH_IMAGE", url };
+  try {
+    const response: FetchImageResponse | undefined = await browser.tabs.sendMessage(tabId, request);
+    if (response?.ok && response.dataUrl) return { dataUrl: response.dataUrl };
+    return { error: `content script: ${response?.error ?? "échec sans détail"}` };
+  } catch (error) {
+    return { error: `onglet injoignable: ${describeError(error)}` };
   }
-
-  // 2. Repli : téléchargement direct par Chrome (peut être bloqué par le site).
-  const direct = await downloadAndWait(url, filename);
-  if (direct.ok) return { ok: true };
-  return {
-    ok: false,
-    error: [
-      "data URL:" + ("error" in fetched ? ` ${fetched.error}` : " ok mais download KO"),
-      `direct: ${direct.error ?? "KO"}`,
-    ].join(" | "),
-  };
 }
 
-async function raijinUrlIsImage(
-  tabId: number | undefined,
-  url: string
-): Promise<boolean> {
-  // Via le content script : même session, réponse fiable.
-  const probe = await fetchViaContentScript(tabId, url);
-  if ("dataUrl" in probe) return true;
-  return false;
+async function reportProgress({ done, total }: { done: number; total: number }): Promise<void> {
+  const progress: DownloadProgress = { type: "DOWNLOAD_PROGRESS", done, total };
+  await browser.runtime.sendMessage(progress).catch(() => undefined);
 }
 
-async function downloadAndWait(
-  url: string,
-  filename: string
-): Promise<{ ok: boolean; error?: string }> {
+async function deliverFile({
+  bytes,
+  filename,
+  mime,
+}: {
+  bytes: Bytes;
+  filename: string;
+  mime: string;
+}): Promise<{ ok: boolean; error?: string }> {
+  if (typeof URL.createObjectURL === "function") {
+    const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+    try {
+      return await downloadAndWait({ url, filename, expectImage: false });
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+  return deliverFileThroughOffscreen({ bytes, filename, mime });
+}
+
+const offscreenDocument: OffscreenDocument = {
+  async ensure() {
+    const offscreen = browser.offscreen;
+    if (!offscreen) throw new Error("API offscreen indisponible dans ce navigateur");
+    if (await offscreen.hasDocument()) return;
+    await offscreen.createDocument({
+      url: "offscreen.html",
+      reasons: ["BLOBS"],
+      justification: "Assembler le fichier CBZ en mémoire et créer son URL blob pour le téléchargement.",
+    });
+  },
+  reset() {
+    void browser.offscreen?.closeDocument().catch(() => undefined);
+  },
+};
+
+async function withOffscreenDocument<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    await offscreenDocument.ensure();
+    return await run();
+  } finally {
+    offscreenDocument.reset();
+  }
+}
+
+async function deliverFileThroughOffscreen({
+  bytes,
+  filename,
+  mime,
+}: {
+  bytes: Bytes;
+  filename: string;
+  mime: string;
+}): Promise<{ ok: boolean; error?: string }> {
+  return withOffscreenDocument(async () => {
+    let response: unknown;
+    try {
+      response = await browser.runtime.sendMessage({
+        type: "CREATE_BLOB_URL",
+        base64: bytesToBase64(bytes),
+        mime,
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        error: `transmission du fichier au document offscreen impossible (${describeError(error)}). Réessaie en mode « images séparées ».`,
+      };
+    }
+
+    const blobUrl = readBlobUrl(response);
+    if (!blobUrl) return { ok: false, error: "le document offscreen n'a pas pu assembler le fichier" };
+
+    try {
+      return await downloadAndWait({ url: blobUrl, filename, expectImage: false });
+    } finally {
+      const revoke: RevokeBlobUrlRequest = { type: "REVOKE_BLOB_URL", url: blobUrl };
+      await browser.runtime.sendMessage(revoke).catch(() => undefined);
+    }
+  });
+}
+
+const readBlobUrl = (value: unknown): string | undefined => {
+  if (typeof value !== "object" || value === null) return undefined;
+  if (!("url" in value)) return undefined;
+  const url: unknown = Reflect.get(value, "url");
+  return typeof url === "string" ? url : undefined;
+};
+
+async function downloadAndWait(target: DownloadTarget): Promise<{ ok: boolean; error?: string }> {
   let downloadId: number;
   try {
     downloadId = await browser.downloads.download({
-      url,
-      filename,
+      url: target.url,
+      filename: target.filename,
       saveAs: false,
+      conflictAction: "uniquify",
     });
-  } catch (err) {
-    // Rejet immédiat de downloads.download() (URL invalide, quota, etc.)
-    const msg = err instanceof Error ? err.message : String(err);
-    return { ok: false, error: msg };
+  } catch (error) {
+    return { ok: false, error: describeError(error) };
   }
-  return waitForDownload(downloadId);
-}
-
-function describeDownloadItem(item: Browser.downloads.DownloadItem | undefined): string {
-  if (!item) return "entrée de téléchargement introuvable";
-  return `state=${item.state}, mime=${item.mime ?? "?"}, bytesReceived=${item.bytesReceived}, error=${
-    item.error ?? "-"
-  }`;
+  return waitForDownload(downloadId, target);
 }
 
 async function waitForDownload(
-  downloadId: number
+  downloadId: number,
+  target: DownloadTarget,
 ): Promise<{ ok: boolean; error?: string }> {
-  // Vérifie d'abord si le téléchargement est déjà terminé (cas des fichiers très rapides)
   const [initial] = await browser.downloads.search({ id: downloadId });
-  if (initial?.state === "complete") {
-    return isImageDownload(initial, downloadId);
-  }
+  if (initial?.state === "complete") return verifyDownload(initial, downloadId, target);
   if (initial?.state === "interrupted" || initial?.error) {
-    return {
-      ok: false,
-      error: `interrompu avant démarrage — ${describeDownloadItem(initial)}`,
-    };
+    return { ok: false, error: `interrompu avant démarrage — ${describeDownloadItem(initial)}` };
   }
 
   return new Promise((resolve) => {
@@ -280,11 +429,10 @@ async function waitForDownload(
     }
 
     async function checkNow() {
-      // Rattrape un téléchargement qui s'est terminé entre le search initial et l'écoute
       const [item] = await browser.downloads.search({ id: downloadId });
       if (!item) return;
       if (item.state === "complete") {
-        finish(await isImageDownload(item, downloadId));
+        finish(await verifyDownload(item, downloadId, target));
       } else if (item.state === "interrupted" || item.error) {
         finish({ ok: false, error: `interrompu — ${describeDownloadItem(item)}` });
       }
@@ -295,13 +443,16 @@ async function waitForDownload(
       const state = delta.state?.current;
 
       if (state === "complete") {
-        browser.downloads.search({ id: downloadId }).then(async ([done]) =>
-          finish(await isImageDownload(done, downloadId))
-        );
+        void browser.downloads
+          .search({ id: downloadId })
+          .then(([item]) => verifyDownload(item, downloadId, target))
+          .then(finish);
       } else if (state === "interrupted" || delta.error?.current) {
-        void browser.downloads.search({ id: downloadId }).then(([item]) =>
-          finish({ ok: false, error: `interrompu — ${describeDownloadItem(item)}` })
-        );
+        void browser.downloads
+          .search({ id: downloadId })
+          .then(([item]) =>
+            finish({ ok: false, error: `interrompu — ${describeDownloadItem(item)}` }),
+          );
       }
     }
 
@@ -310,18 +461,41 @@ async function waitForDownload(
   });
 }
 
-async function isImageDownload(
+async function verifyDownload(
   item: Browser.downloads.DownloadItem | undefined,
-  downloadId: number
+  downloadId: number,
+  target: DownloadTarget,
 ): Promise<{ ok: boolean; error?: string }> {
-  // Certains sites renvoient une page 404 avec un statut 200 ; on supprime alors l'entrée
   if (!item) return { ok: false, error: "entrée de téléchargement introuvable" };
-  if (item.mime && !item.mime.startsWith("image/")) {
+  if (target.expectImage && item.mime && !item.mime.startsWith("image/")) {
     await browser.downloads.erase({ id: downloadId }).catch(() => []);
     return { ok: false, error: `le serveur n'a pas renvoyé une image (mime=${item.mime})` };
   }
   return { ok: true };
 }
+
+const describeDownloadItem = (item: Browser.downloads.DownloadItem | undefined): string => {
+  if (!item) return "entrée de téléchargement introuvable";
+  return `state=${item.state}, mime=${item.mime ?? "?"}, bytesReceived=${item.bytesReceived}, error=${
+    item.error ?? "-"
+  }`;
+};
+
+const describeError = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
+
+const zipEntryName = ({ index, extension }: { index: number; extension: string }): string =>
+  `${String(index).padStart(PAGE_NUMBER_WIDTH, "0")}${extension}`;
+
+const fileName = (url: string): string => {
+  const clean = url.split("?")[0];
+  return clean.slice(clean.lastIndexOf("/") + 1);
+};
+
+const pageNumber = (url: string): number => {
+  const match = url.match(/(\d+)\.(?:png|jpe?g|webp|gif|avif)(?:[?#].*)?$/i);
+  return match ? Number(match[1]) : 0;
+};
 
 function toTitleCase(slug: string) {
   return slug
