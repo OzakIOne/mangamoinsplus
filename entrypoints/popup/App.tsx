@@ -20,6 +20,10 @@ export default function App() {
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [format, setFormat] = useState<OutputFormat>("cbz");
   const [chapter, setChapter] = useState<ChapterInfo | null>(null);
+  const [details, setDetails] = useState<string[]>([]);
+  const [workerBuild, setWorkerBuild] = useState<string | null>(null);
+  const [dnrRules, setDnrRules] = useState<number | null>(null);
+  const [showDebug, setShowDebug] = useState(false);
 
   useEffect(() => {
     void detectChapter();
@@ -52,6 +56,7 @@ export default function App() {
     if (!chapter) return;
     setStatus("loading");
     setProgress(null);
+    setDetails([]);
     setMessage("Préparation…");
 
     const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
@@ -65,6 +70,9 @@ export default function App() {
       setMessage("Réponse inattendue du service worker.");
       return;
     }
+    setDetails(result.details ?? []);
+    setWorkerBuild(result.build ?? null);
+    setDnrRules(result.dnr ?? null);
     if (result.error) {
       setStatus("error");
       setMessage(`❌ ${result.downloaded} page(s) avant échec — ${result.error}`);
@@ -76,10 +84,13 @@ export default function App() {
       return;
     }
     setStatus("done");
+    const skippedNote = result.skipped
+      ? ` · ${result.skipped} page(s) absente(s) du site, ignorée(s)`
+      : "";
     setMessage(
       result.file
-        ? `✅ ${result.downloaded} pages → ${result.file}`
-        : `✅ ${result.downloaded} page${result.downloaded > 1 ? "s" : ""} téléchargée${result.downloaded > 1 ? "s" : ""}`,
+        ? `✅ ${result.downloaded} pages → ${result.file}${skippedNote}`
+        : `✅ ${result.downloaded} page${result.downloaded > 1 ? "s" : ""} téléchargée${result.downloaded > 1 ? "s" : ""}${skippedNote}`,
     );
   }
 
@@ -133,9 +144,65 @@ export default function App() {
         </p>
       )}
       {message && status !== "loading" && <p style={{ marginTop: 8, fontSize: 12 }}>{message}</p>}
+
+      {details.length > 0 && (
+        <ul style={{ margin: "8px 0 0", paddingLeft: 16, fontSize: 10, wordBreak: "break-all" }}>
+          {details.map((detail) => (
+            <li key={detail}>{detail}</li>
+          ))}
+        </ul>
+      )}
+
+      <button
+        onClick={() => setShowDebug((visible) => !visible)}
+        style={{ marginTop: 10, fontSize: 10, background: "none", border: "none", color: "#666", cursor: "pointer", padding: 0 }}
+      >
+        {showDebug ? "masquer le debug" : "debug"}
+      </button>
+
+      {showDebug && (
+        <pre
+          style={{
+            margin: "6px 0 0",
+            padding: 8,
+            background: "#f4f4f4",
+            borderRadius: 4,
+            fontSize: 10,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-all",
+          }}
+        >
+          {debugReport({ chapter, workerBuild, details, dnrRules })}
+        </pre>
+      )}
     </div>
   );
 }
+
+const debugReport = ({
+  chapter,
+  workerBuild,
+  details,
+  dnrRules,
+}: {
+  chapter: ChapterInfo | null;
+  workerBuild: string | null;
+  details: string[];
+  dnrRules: number | null;
+}): string => {
+  const manifest = browser.runtime.getManifest();
+  return [
+    `extension  ${manifest.version}`,
+    `popup      ${__BUILD_TIME__}`,
+    `worker     ${workerBuild ?? "inconnu (aucun téléchargement lancé)"}`,
+    `règles DNR ${dnrRules ?? "inconnu"}`,
+    `hôtes      ${(manifest.host_permissions ?? []).join(", ")}`,
+    `chapitre   ${chapter ? JSON.stringify(chapter) : "non détecté"}`,
+    details.length > 0 ? `échecs     ${details.length}` : "",
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
+};
 
 function toTitleCase(slug: string) {
   return slug

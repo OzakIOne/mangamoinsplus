@@ -5,6 +5,9 @@ interface MangamoinsChapter {
   chapterSlug: string;
   totalPages: number;
   baseUrl: string;
+  firstPage?: number;
+  pagePadding?: number;
+  imageExtension?: string;
 }
 
 interface RaijinChapter {
@@ -30,6 +33,10 @@ export interface DownloadResult {
   downloaded: number;
   error?: string;
   file?: string;
+  skipped?: number;
+  details?: string[];
+  build?: string;
+  dnr?: number;
 }
 
 export interface DownloadProgress {
@@ -99,9 +106,17 @@ export const readDownloadResult = (value: unknown): DownloadResult | undefined =
   if (typeof downloaded !== "number") return undefined;
   const error = Reflect.get(value, "error");
   const file = Reflect.get(value, "file");
+  const skipped = Reflect.get(value, "skipped");
+  const details = Reflect.get(value, "details");
+  const build = Reflect.get(value, "build");
+  const dnr = Reflect.get(value, "dnr");
   return {
     downloaded,
     ...(typeof error === "string" ? { error } : {}),
     ...(typeof file === "string" ? { file } : {}),
+    ...(typeof skipped === "number" ? { skipped } : {}),
+    ...(Array.isArray(details) ? { details: details.filter((d): d is string => typeof d === "string") } : {}),
+    ...(typeof build === "string" ? { build } : {}),
+    ...(typeof dnr === "number" ? { dnr } : {}),
   };
 };

@@ -6,7 +6,8 @@ A Chrome/Firefox extension that downloads manga chapters as image files from [ma
 
 - **Auto-detects chapters**: open any chapter page on a supported site and the popup shows the manga title, chapter number, and page count.
 - **One-click download**: the whole chapter is packed into a single `.cbz` archive (e.g. `One Piece/Chapter 1100.cbz`) ready for any comic reader. Untick **Regrouper en un fichier .cbz** to get the pages as separate image files instead.
-- **Works around anti-hotlinking**: images are fetched through the page itself (same session, real cookies) so Cloudflare-protected servers don't block the download.
+- **Works around anti-hotlinking**: images are fetched through the page itself (same session, real cookies), with a `declarativeNetRequest` rule that adds the missing CORS headers on the image CDN, so the extension can still read the bytes.
+- **Tolerates incomplete chapters**: if the site advertises more pages than its CDN serves (inserted ad pages, deleted pages), the missing ones are skipped instead of aborting the whole download.
 - **Robust page detection**: reads the reader's embedded image list first, then falls back to scanning loaded images / probing URL patterns — including split chapters like `346-1`, `346-2`.
 
 ## Install in your browser
@@ -48,6 +49,8 @@ Then open `about:debugging#/runtime/this-firefox`, click **Load Temporary Add-on
 1. Navigate to a chapter page on mangamoins.com or raijin-scans.fr.
 2. Click the extension icon — the chapter is detected automatically.
 3. Hit **Download Chapter**. The chapter lands in your default Downloads folder as a `.cbz` file (or as a folder of images if you untick the checkbox).
+
+If a download fails, open the small **debug** link at the bottom of the popup: it shows the extension version, the build stamps of the popup and the service worker (handy to check a reload actually happened), the detected chapter data, and the first few failed URLs with their HTTP status.
 
 ## Development
 

@@ -53,9 +53,11 @@ export const sniffImageExtension = (bytes: Uint8Array): string | undefined => {
 };
 
 export const imageExtension = ({ url, bytes }: { url: string; bytes: Uint8Array }): string => {
+  const sniffed = sniffImageExtension(bytes);
+  if (sniffed) return sniffed;
   const fromUrl = url.match(/\.(png|jpe?g|webp|gif|avif)(?:[?#]|$)/i)?.[1];
   if (fromUrl) return `.${fromUrl.toLowerCase()}`;
-  return sniffImageExtension(bytes) ?? ".jpg";
+  return ".jpg";
 };
 
 export const looksLikeImage = (bytes: Uint8Array): boolean =>

@@ -58,21 +58,48 @@ function getMangamoinsInfo(): ChapterInfo | null {
   if (!match) return null;
   const chapterSlug = match[1];
   const totalPages = Number(document.getElementById("readerTotalPages")?.textContent);
-  const img = document.querySelector("img[src*='.webp']") as HTMLImageElement;
-  if (!img) return null;
   if (!Number.isFinite(totalPages) || totalPages < 1) return null;
-  const src = img.src;
 
-  const baseMatch = src.match(/(.*\/)(\d+)\.webp$/);
-  if (!baseMatch) return null;
-  const baseUrl = baseMatch[1];
+  const source = findMangamoinsPageSource();
+  if (!source) return null;
 
   return {
     site: "mangamoins",
     chapterSlug,
     totalPages,
-    baseUrl,
+    baseUrl: source.baseUrl,
+    firstPage: source.firstPage,
+    pagePadding: source.pagePadding,
+    imageExtension: source.imageExtension,
   };
+}
+
+/**
+ * Les pages vivent sur un CDN dédié, sous la forme `<base>/<hash>/01.webp`.
+ * On lit la largeur réelle et le numéro de la page affichée plutôt que de les
+ * déduire du nombre total de pages : le compteur du lecteur inclut les pages
+ * publicitaires intercalées, pas le CDN.
+ */
+function findMangamoinsPageSource():
+  | { baseUrl: string; firstPage: number; pagePadding: number; imageExtension: string }
+  | null {
+  const readers = document.querySelectorAll<HTMLImageElement>(
+    "img.reader-manga-page, .reader-image-wrapper img, img[src*='.webp']",
+  );
+  const numbered = /^(.*\/)(\d+)\.(webp|png|jpe?g|gif|avif)(?:[?#].*)?$/i;
+
+  for (const image of readers) {
+    const candidate = image.currentSrc || image.src;
+    const match = candidate.match(numbered);
+    if (!match) continue;
+    return {
+      baseUrl: match[1],
+      firstPage: Number(match[2]),
+      pagePadding: match[2].length,
+      imageExtension: `.${match[3].toLowerCase()}`,
+    };
+  }
+  return null;
 }
 
 function getRaijinInfo(url: string): ChapterInfo | null {

@@ -20,6 +20,7 @@ import { createZip, type ZipFile } from "@/lib/zip";
 
 const MAX_PAGES = 500;
 const MAX_CONSECUTIVE_MISSES = 5;
+const MAX_FAILURE_DETAILS = 5;
 const CBZ_MIME = "application/vnd.comicbook+zip";
 const PAGE_NUMBER_WIDTH = 4;
 const IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"];
@@ -53,6 +54,9 @@ interface DownloadTarget {
   expectImage: boolean;
 }
 
+let lastFetchFailure: string | undefined;
+let failureLog: string[] = [];
+
 interface OffscreenDocument {
   ensure: () => Promise<void>;
   reset: () => void;
@@ -60,17 +64,63 @@ interface OffscreenDocument {
 
 export default defineBackground({
   main() {
+    void ensureCdnHeaderRule();
     browser.runtime.onMessage.addListener((message: unknown) => {
       if (!isDownloadRequest(message)) return undefined;
-      return downloadChapter(message).catch((error) => ({
-        downloaded: 0,
-        error: describeError(error),
-      }));
+      return downloadChapter(message)
+        .catch((error) => ({ downloaded: 0, error: describeError(error) }))
+        .then((result) => withDiagnostics(result));
     });
   },
 });
 
+const withDiagnostics = (result: DownloadResult): DownloadResult => ({
+  ...result,
+  build: __BUILD_TIME__,
+  dnr: dnrRuleCount,
+  ...(failureLog.length > 0 ? { details: [...failureLog] } : {}),
+});
+
+const CDN_HEADER_RULE_ID = 1;
+let dnrRuleCount: number | undefined;
+
+// Le CDN d'images est protégé contre le hotlink : une requête cross-site (celle
+// du service worker, origine `chrome-extension://`) est refusée, alors que la
+// page du site y accède (same-site). On retire l'origine de la requête et on
+// ajoute les en-têtes CORS sur la réponse, pour que le content script — qui
+// parle depuis la page — puisse lire les octets.
+const ensureCdnHeaderRule = async (): Promise<void> => {
+  const rules = browser.declarativeNetRequest;
+  if (!rules) return;
+  const rule: Browser.declarativeNetRequest.Rule = {
+    id: CDN_HEADER_RULE_ID,
+    priority: 1,
+    action: {
+      type: "modifyHeaders",
+      requestHeaders: [
+        { header: "origin", operation: "remove" },
+        { header: "referer", operation: "set", value: "https://mangamoins.com/" },
+      ],
+      responseHeaders: [
+        { header: "access-control-allow-origin", operation: "set", value: "https://mangamoins.com" },
+        { header: "access-control-allow-credentials", operation: "set", value: "true" },
+        { header: "cross-origin-resource-policy", operation: "remove" },
+      ],
+    },
+    condition: {
+      urlFilter: "||mangamoinsscans.mangamoins.com/",
+      resourceTypes: ["xmlhttprequest", "other"],
+    },
+  };
+  await rules
+    .updateDynamicRules({ removeRuleIds: [CDN_HEADER_RULE_ID], addRules: [rule] })
+    .catch(() => undefined);
+  dnrRuleCount = (await rules.getDynamicRules().catch(() => [])).length;
+};
+
 async function downloadChapter({ format, tabId, chapter }: DownloadRequest): Promise<DownloadResult> {
+  lastFetchFailure = undefined;
+  failureLog = [];
   const plan = planChapter(chapter);
   if (plan.pages.length === 0 && !plan.probe) {
     return { downloaded: 0, error: "Aucune image trouvée sur la page du chapitre" };
@@ -82,11 +132,13 @@ function planChapter(chapter: ChapterInfo): ChapterPlan {
   return chapter.site === "mangamoins" ? planMangamoins(chapter) : planRaijin(chapter);
 }
 
-function planMangamoins({ chapterSlug, totalPages, baseUrl }: Extract<ChapterInfo, { site: "mangamoins" }>): ChapterPlan {
-  const padding = Math.max(2, String(totalPages).length);
+function planMangamoins({ chapterSlug, totalPages, baseUrl, firstPage, pagePadding, imageExtension }: Extract<ChapterInfo, { site: "mangamoins" }>): ChapterPlan {
+  const padding = pagePadding && pagePadding > 0 ? pagePadding : Math.max(2, String(totalPages).length);
+  const extension = imageExtension ?? ".webp";
+  const start = firstPage && firstPage > 0 ? firstPage : 1;
   const pages = Array.from({ length: totalPages }, (_, index) => {
-    const number = String(index + 1).padStart(padding, "0");
-    return { url: `${baseUrl}${number}.webp`, name: `page_${number}.webp` };
+    const number = String(start + index).padStart(padding, "0");
+    return { url: `${baseUrl}${number}${extension}`, name: `page_${number}${extension}` };
   });
   return { folder: chapterSlug, pages, preferDirect: true };
 }
@@ -118,34 +170,42 @@ function planRaijin({ mangaSlug, chapterSlug, imageUrls, baseUrl, pagePadding, i
 
 async function downloadAsCbz({ tabId, plan }: { tabId: number | undefined; plan: ChapterPlan }): Promise<DownloadResult> {
   const files: ZipFile[] = [];
+  let skipped = 0;
+  let consecutiveMisses = 0;
 
   for await (const page of chapterPages({ tabId, plan })) {
-    const bytes = page.bytes ?? (await fetchImageBytes({ tabId, url: page.url, attempts: 2 }));
+    const bytes =
+      page.bytes ?? (await fetchImageBytes({ tabId, url: page.url, attempts: 2 }));
+    // Le compteur du lecteur peut annoncer plus de pages que le CDN n'en sert
+    // (pages publicitaires intercalées) : une page absente est sautée, pas fatale.
     if (!bytes) {
-      return {
-        downloaded: files.length,
-        error: `Page ${files.length + 1} illisible (${page.url}). Réessaie, ou passe en mode « images séparées ».`,
-      };
+      skipped++;
+      consecutiveMisses++;
+      if (consecutiveMisses >= MAX_CONSECUTIVE_MISSES) break;
+      continue;
     }
+    consecutiveMisses = 0;
     files.push({
       name: zipEntryName({ index: files.length + 1, extension: imageExtension({ url: page.url, bytes }) }),
       bytes,
     });
-    void reportProgress({ done: files.length, total: plan.pages.length });
+    void reportProgress({ done: files.length + skipped, total: plan.pages.length });
   }
 
   if (files.length === 0) {
-    return { downloaded: 0, error: "Aucune page récupérable pour ce chapitre." };
+    return { downloaded: 0, error: `Aucune page récupérable pour ce chapitre.${failureDetail()}` };
   }
 
   const filename = `${plan.folder}.cbz`;
   const delivery = await deliverFile({ bytes: createZip({ files }), filename, mime: CBZ_MIME });
   if (!delivery.ok) return { downloaded: files.length, error: delivery.error };
-  return { downloaded: files.length, file: filename };
+  return { downloaded: files.length, file: filename, ...(skipped > 0 ? { skipped } : {}) };
 }
 
 async function downloadAsImages({ tabId, plan }: { tabId: number | undefined; plan: ChapterPlan }): Promise<DownloadResult> {
   let downloaded = 0;
+  let skipped = 0;
+  let consecutiveMisses = 0;
 
   for await (const page of chapterPages({ tabId, plan })) {
     const filename = `${plan.folder}/${page.name}`;
@@ -153,19 +213,26 @@ async function downloadAsImages({ tabId, plan }: { tabId: number | undefined; pl
       page.bytes ?? (plan.preferDirect ? undefined : await fetchImageBytes({ tabId, url: page.url, attempts: 2 }));
     const saved = await savePage({ tabId, plan, page, filename, preloaded });
     if (!saved.ok) {
-      return {
-        downloaded,
-        error: `Page ${downloaded + 1} (${page.name}) : ${saved.error ?? "échec inconnu"}`,
-      };
+      skipped++;
+      consecutiveMisses++;
+      if (consecutiveMisses >= MAX_CONSECUTIVE_MISSES) {
+        return {
+          downloaded,
+          skipped,
+          error: `Page ${page.name} : ${saved.error ?? "échec inconnu"}`,
+        };
+      }
+      continue;
     }
+    consecutiveMisses = 0;
     downloaded++;
-    void reportProgress({ done: downloaded, total: plan.pages.length });
+    void reportProgress({ done: downloaded + skipped, total: plan.pages.length });
   }
 
   if (downloaded === 0) {
-    return { downloaded: 0, error: "Aucune page récupérable pour ce chapitre." };
+    return { downloaded: 0, error: `Aucune page récupérable pour ce chapitre.${failureDetail()}` };
   }
-  return { downloaded };
+  return { downloaded, ...(skipped > 0 ? { skipped } : {}) };
 }
 
 async function savePage({
@@ -186,7 +253,8 @@ async function savePage({
     if (direct.ok) return direct;
   }
 
-  const bytes = preloaded ?? (await fetchImageBytes({ tabId, url: page.url, attempts: 2 }));
+  const bytes =
+    preloaded ?? (await fetchImageBytes({ tabId, url: page.url, attempts: 2 }));
   if (!bytes) return { ok: false, error: "récupération impossible (session ou protection anti-hotlink)" };
 
   const dataUrl = `data:${imageMime(imageExtension({ url: page.url, bytes }))};base64,${bytesToBase64(bytes)}`;
@@ -263,6 +331,8 @@ async function fetchImageOnce({
   tabId: number | undefined;
   url: string;
 }): Promise<Bytes | undefined> {
+  // La page est le seul contexte autorisé par la protection anti-hotlink du CDN :
+  // on passe par le content script, puis on tente le service worker en secours.
   const fromPage = await fetchViaContentScript({ tabId, url });
   if ("dataUrl" in fromPage) {
     const bytes = dataUrlToBytes(fromPage.dataUrl);
@@ -274,10 +344,19 @@ async function fetchImageOnce({
 async function fetchImageDirectly(url: string): Promise<Bytes | undefined> {
   try {
     const response = await fetch(url, { credentials: "include" });
-    if (!response.ok) return undefined;
+    const contentType = response.headers.get("content-type") ?? "sans content-type";
+    if (!response.ok) {
+      noteFailure(`${url} → HTTP ${response.status} (${contentType})`);
+      return undefined;
+    }
     const bytes = new Uint8Array(await response.arrayBuffer());
-    return looksLikeImage(bytes) ? bytes : undefined;
-  } catch {
+    if (!looksLikeImage(bytes)) {
+      noteFailure(`${url} → ${contentType}, ${bytes.length} octets non reconnus comme image`);
+      return undefined;
+    }
+    return bytes;
+  } catch (error) {
+    noteFailure(`${url} → ${describeError(error)}`);
     return undefined;
   }
 }
@@ -294,9 +373,13 @@ async function fetchViaContentScript({
   try {
     const response: FetchImageResponse | undefined = await browser.tabs.sendMessage(tabId, request);
     if (response?.ok && response.dataUrl) return { dataUrl: response.dataUrl };
-    return { error: `content script: ${response?.error ?? "échec sans détail"}` };
+    const error = `content script: ${response?.error ?? "échec sans détail"}`;
+    noteFailure(`${url} → ${error}`);
+    return { error };
   } catch (error) {
-    return { error: `onglet injoignable: ${describeError(error)}` };
+    const description = `onglet injoignable: ${describeError(error)}`;
+    noteFailure(`${url} → ${description}`);
+    return { error: description };
   }
 }
 
@@ -483,6 +566,14 @@ const describeDownloadItem = (item: Browser.downloads.DownloadItem | undefined):
 
 const describeError = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
+
+const failureDetail = (): string =>
+  lastFetchFailure ? ` Dernier essai : ${lastFetchFailure}` : "";
+
+const noteFailure = (message: string): void => {
+  lastFetchFailure = message;
+  if (failureLog.length < MAX_FAILURE_DETAILS) failureLog.push(message);
+};
 
 const zipEntryName = ({ index, extension }: { index: number; extension: string }): string =>
   `${String(index).padStart(PAGE_NUMBER_WIDTH, "0")}${extension}`;
